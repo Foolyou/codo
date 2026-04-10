@@ -1,0 +1,20 @@
+{
+  "runtime": {
+    "name": "codo-assistant",
+    "image": "codo:latest",
+    "workspace_path": "..",
+    "workspace_label": "workspace",
+    "workspace_mount_path": "/workspace",
+    "host_state_dir": "../.runtime",
+    "container_control_dir": "/run/codo"
+  },
+  "provider": {
+    "type": "bailian-openai-compatible",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "api_key_env": "BAILIAN_API_KEY"
+  },
+  "proxy": {},
+  "audit": {
+    "preview_bytes": 4096
+  }
+}

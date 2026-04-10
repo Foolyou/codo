@@ -1,0 +1,27 @@
+# Local Codex workspace metadata
+.codex/
+
+# Local secrets and operator overrides
+.env
+.env.*
+!.env.example
+
+# Go build and test artifacts
+bin/
+dist/
+coverage.out
+*.coverprofile
+*.test
+
+# Assistant runtime local state
+.cache/
+.runtime/
+tmp/
+*.pid
+*.sock
+*.socket
+
+# Host-side logs and append-only audit records
+*.log
+*.jsonl
+*.jsonl.*
