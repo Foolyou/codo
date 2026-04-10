@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,8 @@ import (
 	"github.com/chenan/codo/internal/config"
 	"github.com/chenan/codo/internal/ids"
 )
+
+var ErrAssistantRuntimeOutOfDate = errors.New("runtime container codo binary is incompatible with assistant chat")
 
 type Mount struct {
 	Source   string `json:"source"`
@@ -39,6 +42,7 @@ func BuildContainerSpec(cfg config.Config, state State) ContainerSpec {
 			EnvRuntimeInstanceID:  state.RuntimeInstanceID,
 			EnvWorkspaceID:        cfg.Runtime.WorkspaceLabel,
 			EnvWorkspacePathLabel: cfg.Runtime.WorkspaceLabel,
+			EnvWorkspaceMountPath: cfg.Runtime.WorkspaceMountPath,
 			EnvAuditSocket:        filepath.Join(cfg.Runtime.ContainerControlDir, filepath.Base(cfg.Audit.SocketPath)),
 			EnvAuditPreviewBytes:  strconv.Itoa(cfg.Audit.PreviewBytes),
 			EnvModelProxySocket:   filepath.Join(cfg.Runtime.ContainerControlDir, filepath.Base(cfg.Proxy.SocketPath)),
@@ -262,6 +266,45 @@ func ReconnectRuntime(ctx context.Context, cfg config.Config, sessionID string) 
 	return nil
 }
 
+func ProbeAssistantREPL(ctx context.Context, cfg config.Config, opts AssistantREPLOptions) error {
+	state, _, err := LoadOrCreateState(cfg.RuntimeStatePath(), cfg.Runtime.Name)
+	if err != nil {
+		return err
+	}
+
+	normalized, err := normalizeAssistantREPLOptions(opts)
+	if err != nil {
+		return err
+	}
+
+	args := BuildDockerExecArgs(
+		state.ContainerName,
+		normalized.SessionID,
+		cfg.Runtime.WorkspaceMountPath,
+		buildAssistantReplCommand(normalized, cfg.Runtime.WorkspaceMountPath),
+		false,
+	)
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		output := strings.TrimSpace(strings.TrimSpace(stdout.String()) + "\n" + strings.TrimSpace(stderr.String()))
+		if assistantRuntimeOutOfDate(output) {
+			if output == "" {
+				return ErrAssistantRuntimeOutOfDate
+			}
+			return fmt.Errorf("%w: %s", ErrAssistantRuntimeOutOfDate, output)
+		}
+		if output != "" {
+			return fmt.Errorf("probe assistant repl in runtime: %w: %s", err, output)
+		}
+		return fmt.Errorf("probe assistant repl in runtime: %w", err)
+	}
+	return nil
+}
+
 func RuntimeStatus(ctx context.Context, cfg config.Config) error {
 	state, _, err := LoadOrCreateState(cfg.RuntimeStatePath(), cfg.Runtime.Name)
 	if err != nil {
@@ -293,4 +336,19 @@ func RuntimeStatus(ctx context.Context, cfg config.Config) error {
 	}
 	fmt.Printf("docker_status=%s\n", strings.TrimSpace(string(output)))
 	return nil
+}
+
+func assistantRuntimeOutOfDate(output string) bool {
+	switch {
+	case strings.Contains(output, "unknown assistant subcommand"):
+		return true
+	case strings.Contains(output, "flag provided but not defined"):
+		return true
+	case strings.Contains(output, "usage: codo <control-plane|runtime> ..."):
+		return true
+	case strings.Contains(output, "usage: codo <up|control-plane|runtime> ..."):
+		return true
+	default:
+		return false
+	}
 }

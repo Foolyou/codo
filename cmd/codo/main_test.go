@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/chenan/codo/internal/config"
+	codoruntime "github.com/chenan/codo/internal/runtime"
 )
 
 func TestRunControlPlaneServeUsesDefaultHomeConfig(t *testing.T) {
@@ -119,6 +122,252 @@ func TestRunUpPassesResolvedFlagValueToBootstrap(t *testing.T) {
 	}
 	if gotConfigPath != configPath {
 		t.Fatalf("unexpected up config path: got %q want %q", gotConfigPath, configPath)
+	}
+}
+
+func TestRunAssistantChatReusesHealthyControlPlane(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "runtime.json")
+	workspacePath := filepath.Join(tempDir, "workspace")
+	writeConfigFile(t, configPath, workspacePath)
+
+	var callOrder []string
+	app := cli{
+		loadConfig: loadConfig,
+		controlPlaneHealthy: func(_ context.Context, cfg config.Config) error {
+			callOrder = append(callOrder, "health")
+			if cfg.Runtime.WorkspacePath != workspacePath {
+				t.Fatalf("unexpected workspace path: got %q want %q", cfg.Runtime.WorkspacePath, workspacePath)
+			}
+			return nil
+		},
+		serveControlPlaneReady: func(context.Context, config.Config, chan<- struct{}) error {
+			t.Fatal("serveControlPlaneReady should not be called when sockets are healthy")
+			return nil
+		},
+		ensureRuntimeImage: func(_ context.Context, cfg config.Config) error {
+			callOrder = append(callOrder, "image")
+			if cfg.Runtime.WorkspacePath != workspacePath {
+				t.Fatalf("unexpected workspace path: got %q want %q", cfg.Runtime.WorkspacePath, workspacePath)
+			}
+			return nil
+		},
+		startRuntime: func(_ context.Context, cfg config.Config) error {
+			callOrder = append(callOrder, "runtime")
+			if cfg.Runtime.WorkspacePath != workspacePath {
+				t.Fatalf("unexpected workspace path: got %q want %q", cfg.Runtime.WorkspacePath, workspacePath)
+			}
+			return nil
+		},
+		probeAssistantREPL: func(_ context.Context, cfg config.Config, opts codoruntime.AssistantREPLOptions) error {
+			callOrder = append(callOrder, "probe")
+			if cfg.Runtime.WorkspacePath != workspacePath {
+				t.Fatalf("unexpected workspace path: got %q want %q", cfg.Runtime.WorkspacePath, workspacePath)
+			}
+			if opts.SessionID != "sess_test" {
+				t.Fatalf("unexpected session id: %q", opts.SessionID)
+			}
+			return nil
+		},
+		attachAssistantREPL: func(_ context.Context, cfg config.Config, opts codoruntime.AssistantREPLOptions) error {
+			callOrder = append(callOrder, "attach")
+			if cfg.Runtime.WorkspacePath != workspacePath {
+				t.Fatalf("unexpected workspace path: got %q want %q", cfg.Runtime.WorkspacePath, workspacePath)
+			}
+			if opts.SessionID != "sess_test" {
+				t.Fatalf("unexpected session id: %q", opts.SessionID)
+			}
+			if opts.Model != "qwen-test" {
+				t.Fatalf("unexpected model: %q", opts.Model)
+			}
+			if opts.MaxToolCalls != 3 {
+				t.Fatalf("unexpected max tool calls: %d", opts.MaxToolCalls)
+			}
+			if opts.BashTimeout != 2*time.Second {
+				t.Fatalf("unexpected bash timeout: %s", opts.BashTimeout)
+			}
+			if opts.BashOutputBytes != 2048 {
+				t.Fatalf("unexpected bash output bytes: %d", opts.BashOutputBytes)
+			}
+			return nil
+		},
+	}
+
+	err := app.run(context.Background(), []string{
+		"assistant", "chat",
+		"--config", configPath,
+		"--session-id", "sess_test",
+		"--model", "qwen-test",
+		"--max-tool-calls", "3",
+		"--bash-timeout", "2s",
+		"--bash-output-bytes", "2048",
+	})
+	if err != nil {
+		t.Fatalf("run assistant chat: %v", err)
+	}
+
+	wantOrder := []string{"health", "image", "runtime", "probe", "attach"}
+	if fmt.Sprint(callOrder) != fmt.Sprint(wantOrder) {
+		t.Fatalf("unexpected call order: got %v want %v", callOrder, wantOrder)
+	}
+}
+
+func TestRunAssistantChatStartsSessionScopedControlPlaneWhenUnhealthy(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "runtime.json")
+	workspacePath := filepath.Join(tempDir, "workspace")
+	writeConfigFile(t, configPath, workspacePath)
+
+	controlPlaneStopped := make(chan struct{})
+	var callOrder []string
+	app := cli{
+		loadConfig: loadConfig,
+		controlPlaneHealthy: func(context.Context, config.Config) error {
+			callOrder = append(callOrder, "health")
+			return errors.New("sockets unavailable")
+		},
+		serveControlPlaneReady: func(ctx context.Context, cfg config.Config, ready chan<- struct{}) error {
+			callOrder = append(callOrder, "serve")
+			if cfg.Runtime.WorkspacePath != workspacePath {
+				t.Fatalf("unexpected workspace path: got %q want %q", cfg.Runtime.WorkspacePath, workspacePath)
+			}
+			close(ready)
+			<-ctx.Done()
+			close(controlPlaneStopped)
+			return nil
+		},
+		ensureRuntimeImage: func(_ context.Context, cfg config.Config) error {
+			callOrder = append(callOrder, "image")
+			if cfg.Runtime.WorkspacePath != workspacePath {
+				t.Fatalf("unexpected workspace path: got %q want %q", cfg.Runtime.WorkspacePath, workspacePath)
+			}
+			return nil
+		},
+		startRuntime: func(_ context.Context, cfg config.Config) error {
+			callOrder = append(callOrder, "runtime")
+			if cfg.Runtime.WorkspacePath != workspacePath {
+				t.Fatalf("unexpected workspace path: got %q want %q", cfg.Runtime.WorkspacePath, workspacePath)
+			}
+			return nil
+		},
+		probeAssistantREPL: func(context.Context, config.Config, codoruntime.AssistantREPLOptions) error {
+			callOrder = append(callOrder, "probe")
+			return nil
+		},
+		attachAssistantREPL: func(_ context.Context, _ config.Config, _ codoruntime.AssistantREPLOptions) error {
+			callOrder = append(callOrder, "attach")
+			return nil
+		},
+	}
+
+	if err := app.run(context.Background(), []string{"assistant", "chat", "--config", configPath}); err != nil {
+		t.Fatalf("run assistant chat: %v", err)
+	}
+
+	select {
+	case <-controlPlaneStopped:
+	default:
+		t.Fatal("expected session-scoped control plane to stop after attach")
+	}
+
+	wantOrder := []string{"health", "serve", "image", "runtime", "probe", "attach"}
+	if fmt.Sprint(callOrder) != fmt.Sprint(wantOrder) {
+		t.Fatalf("unexpected call order: got %v want %v", callOrder, wantOrder)
+	}
+}
+
+func TestRunAssistantChatRepairsOutdatedRuntimeBeforeAttach(t *testing.T) {
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "runtime.json")
+	workspacePath := filepath.Join(tempDir, "workspace")
+	writeConfigFile(t, configPath, workspacePath)
+
+	var callOrder []string
+	probeCalls := 0
+	app := cli{
+		loadConfig: loadConfig,
+		controlPlaneHealthy: func(context.Context, config.Config) error {
+			callOrder = append(callOrder, "health")
+			return nil
+		},
+		ensureRuntimeImage: func(context.Context, config.Config) error {
+			callOrder = append(callOrder, "image")
+			return nil
+		},
+		startRuntime: func(context.Context, config.Config) error {
+			callOrder = append(callOrder, "runtime")
+			return nil
+		},
+		probeAssistantREPL: func(_ context.Context, cfg config.Config, _ codoruntime.AssistantREPLOptions) error {
+			callOrder = append(callOrder, "probe")
+			if cfg.Runtime.WorkspacePath != workspacePath {
+				t.Fatalf("unexpected workspace path: got %q want %q", cfg.Runtime.WorkspacePath, workspacePath)
+			}
+			probeCalls++
+			if probeCalls == 1 {
+				return fmt.Errorf("%w: usage: codo <control-plane|runtime> ...", codoruntime.ErrAssistantRuntimeOutOfDate)
+			}
+			return nil
+		},
+		buildRuntimeImage: func(context.Context, config.Config) error {
+			callOrder = append(callOrder, "build")
+			return nil
+		},
+		rebuildRuntime: func(context.Context, config.Config) error {
+			callOrder = append(callOrder, "rebuild")
+			return nil
+		},
+		attachAssistantREPL: func(context.Context, config.Config, codoruntime.AssistantREPLOptions) error {
+			callOrder = append(callOrder, "attach")
+			return nil
+		},
+	}
+
+	if err := app.run(context.Background(), []string{"assistant", "chat", "--config", configPath}); err != nil {
+		t.Fatalf("run assistant chat: %v", err)
+	}
+
+	wantOrder := []string{"health", "image", "runtime", "probe", "build", "rebuild", "probe", "attach"}
+	if fmt.Sprint(callOrder) != fmt.Sprint(wantOrder) {
+		t.Fatalf("unexpected call order: got %v want %v", callOrder, wantOrder)
+	}
+}
+
+func TestRunAssistantReplParsesFlags(t *testing.T) {
+	app := cli{
+		runAssistantREPL: func(_ context.Context, opts codoruntime.AssistantREPLOptions) error {
+			if opts.SessionID != "sess_test" {
+				t.Fatalf("unexpected session id: %q", opts.SessionID)
+			}
+			if opts.Model != "qwen-test" {
+				t.Fatalf("unexpected model: %q", opts.Model)
+			}
+			if opts.WorkspaceRoot != "/workspace" {
+				t.Fatalf("unexpected workspace root: %q", opts.WorkspaceRoot)
+			}
+			if opts.MaxToolCalls != 5 {
+				t.Fatalf("unexpected max tool calls: %d", opts.MaxToolCalls)
+			}
+			if opts.BashTimeout != 45*time.Second {
+				t.Fatalf("unexpected bash timeout: %s", opts.BashTimeout)
+			}
+			if opts.BashOutputBytes != 1234 {
+				t.Fatalf("unexpected bash output bytes: %d", opts.BashOutputBytes)
+			}
+			return nil
+		},
+	}
+
+	if err := app.run(context.Background(), []string{
+		"assistant", "repl",
+		"--session-id", "sess_test",
+		"--model", "qwen-test",
+		"--workspace-root", "/workspace",
+		"--max-tool-calls", "5",
+		"--bash-timeout", "45s",
+		"--bash-output-bytes", "1234",
+	}); err != nil {
+		t.Fatalf("run assistant repl: %v", err)
 	}
 }
 
