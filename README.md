@@ -12,12 +12,13 @@
 
 ## Repository Layout
 
-- `cmd/codo/main.go`: CLI entrypoint for host and container commands.
+- `cmd/codo/main.go`: CLI entrypoint for bootstrap, host, and container commands.
+- `internal/bootstrap/bootstrap.go`: unified `codo up` orchestration.
 - `internal/controlplane/proxy.go`: Bailian OpenAI-compatible model proxy with host-side credential injection and JSONL audit logs.
 - `internal/controlplane/audit.go`: host-side bash audit collector.
 - `internal/runtime/docker.go`: runtime lifecycle tooling and generated Docker container spec.
 - `internal/runtime/bash.go`: audited container-side bash wrapper and model proxy client.
-- `examples/runtime-config.example.json`: example operator config.
+- `examples/runtime-config.example.json`: starter template for copied custom configs.
 
 ## Prerequisites
 
@@ -25,62 +26,89 @@
 - Rootless Docker
 - A Bailian API key exported on the host as `BAILIAN_API_KEY`
 
-## Configuration
+## Default Home Layout
 
-1. Copy `examples/runtime-config.example.json` to a local config file such as `runtime-config.json`.
-2. Set `runtime.workspace_path` to the host directory you want mounted into the assistant container.
-3. Adjust `runtime.host_state_dir` if you want runtime state and audit logs outside `./.runtime`.
-4. Export the provider credential on the host:
+By default, config-backed `codo` commands resolve config in this order:
+
+1. `--config <path>`
+2. `CODO_CONFIG`
+3. `CODO_HOME/config/runtime.json`
+4. `$HOME/.codo/config/runtime.json`
+
+The default home layout is:
+
+- `~/.codo/config/runtime.json`: runtime config file
+- `~/.codo/workspace/`: default workspace mounted into the container
+- `~/.codo/config/state/`: runtime state, sockets, and logs
+
+You can move the root with `CODO_HOME`:
 
 ```bash
-export BAILIAN_API_KEY=your-key-here
+CODO_HOME=/srv/codo ./codo up
 ```
 
-The example config resolves to these stable paths by default:
+## Quick Start
 
-- Workspace mount inside the container: `/workspace`
-- Model proxy socket inside the container: `/run/codo/model-proxy.sock`
-- Audit collector socket inside the container: `/run/codo/audit.sock`
-- Host-side bash audit log: `./.runtime/logs/bash-audit.jsonl`
-- Host-side model proxy audit log: `./.runtime/logs/model-proxy.jsonl`
-
-## Build And Run
-
-Build the binary:
+Build the binary from the repository root:
 
 ```bash
 go build ./cmd/codo
 ```
 
-Start the host control plane:
+Export the provider credential on the host:
 
 ```bash
-./codo control-plane serve --config ./runtime-config.json
+export BAILIAN_API_KEY=your-key-here
 ```
 
-Build the runtime image:
+Bring up the control plane and runtime together:
 
 ```bash
-./codo runtime build-image --config ./runtime-config.json
+./codo up
 ```
 
-Create or start the long-lived runtime container:
+On first run, `codo up` will create:
+
+- `~/.codo/config/runtime.json`
+- `~/.codo/workspace/`
+
+It will also build the runtime image if the configured image is missing locally, then start the host control plane and the long-lived assistant container. The command stays in the foreground until interrupted.
+
+## Low-Level Commands
+
+The low-level commands still work and use the same config discovery rules:
 
 ```bash
-./codo runtime start --config ./runtime-config.json
+./codo control-plane serve
+./codo runtime build-image
+./codo runtime start
+./codo runtime status
+./codo runtime exec "pwd && ls -la"
+./codo runtime reconnect
+./codo runtime rebuild
 ```
 
-Run an audited shell command inside the container:
+Use `--config` when you want a specific file:
 
 ```bash
-./codo runtime exec --config ./runtime-config.json "pwd && ls -la"
+./codo runtime status --config /path/to/runtime.json
 ```
 
-Reconnect to the running container:
+## Custom Configs
 
-```bash
-./codo runtime reconnect --config ./runtime-config.json
-```
+If you want a managed custom config instead of the default home layout, point `--config` or `CODO_CONFIG` at an existing file. `codo up` only auto-creates the default home config; it will fail for a missing custom path instead of writing files implicitly.
+
+The repository template at `examples/runtime-config.example.json` is intended to be copied into a config directory such as `~/.codo/config/runtime.json` or `/srv/codo/config/runtime.json`. Its relative paths are designed to resolve correctly after copying.
+
+## Stable Paths
+
+The default starter config resolves to these paths:
+
+- Workspace mount inside the container: `/workspace`
+- Model proxy socket inside the container: `/run/codo/model-proxy.sock`
+- Audit collector socket inside the container: `/run/codo/audit.sock`
+- Host-side bash audit log: `~/.codo/config/state/logs/bash-audit.jsonl`
+- Host-side model proxy audit log: `~/.codo/config/state/logs/model-proxy.jsonl`
 
 ## Rebuild Flow
 
@@ -93,7 +121,7 @@ Rebuilding removes and recreates the container while preserving:
 Run:
 
 ```bash
-./codo runtime rebuild --config ./runtime-config.json
+./codo runtime rebuild
 ```
 
 This creates a fresh container from the image without depending on any extra long-lived runtime-state volume inside Docker.
@@ -130,13 +158,13 @@ Bash audit records are append-only JSONL entries. Each completed record includes
 Inspect recent bash audit records:
 
 ```bash
-tail -n 20 ./.runtime/logs/bash-audit.jsonl
+tail -n 20 ~/.codo/config/state/logs/bash-audit.jsonl
 ```
 
 Inspect recent model proxy records:
 
 ```bash
-tail -n 20 ./.runtime/logs/model-proxy.jsonl
+tail -n 20 ~/.codo/config/state/logs/model-proxy.jsonl
 ```
 
 ## Model Proxy Usage
@@ -158,6 +186,8 @@ The repository includes tests for:
 - Fail-closed bash execution when the audit collector is unavailable
 - Host-side audit record persistence
 - Host-side proxy credential injection and request audit logging
+- Config discovery precedence and default-home bootstrap behavior
+- Unified `codo up` orchestration and CLI compatibility with low-level commands
 
 Run:
 

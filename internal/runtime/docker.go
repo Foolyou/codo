@@ -188,6 +188,31 @@ func BuildRuntimeImage(ctx context.Context, cfg config.Config) error {
 	return nil
 }
 
+func RuntimeImageAvailable(ctx context.Context, image string) (bool, error) {
+	cmd := exec.CommandContext(ctx, "docker", "image", "inspect", image)
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		return true, nil
+	}
+
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && strings.Contains(string(output), "No such image") {
+		return false, nil
+	}
+	return false, fmt.Errorf("inspect runtime image: %w", err)
+}
+
+func EnsureRuntimeImageAvailable(ctx context.Context, cfg config.Config) error {
+	available, err := RuntimeImageAvailable(ctx, cfg.Runtime.Image)
+	if err != nil {
+		return err
+	}
+	if available {
+		return nil
+	}
+	return BuildRuntimeImage(ctx, cfg)
+}
+
 func ExecInRuntime(ctx context.Context, cfg config.Config, sessionID string, workdir string, shellCommand string) error {
 	state, _, err := LoadOrCreateState(cfg.RuntimeStatePath(), cfg.Runtime.Name)
 	if err != nil {

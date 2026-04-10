@@ -14,6 +14,10 @@ import (
 )
 
 func Serve(ctx context.Context, cfg config.Config) error {
+	return ServeWithReady(ctx, cfg, nil)
+}
+
+func ServeWithReady(ctx context.Context, cfg config.Config, ready chan<- struct{}) error {
 	if err := os.MkdirAll(cfg.Runtime.HostControlDir, 0o755); err != nil {
 		return fmt.Errorf("create host control dir: %w", err)
 	}
@@ -40,6 +44,10 @@ func Serve(ctx context.Context, cfg config.Config) error {
 
 	auditHTTP := &http.Server{Handler: auditCollector.Handler()}
 	proxyHTTP := &http.Server{Handler: proxyServer.Handler()}
+
+	if ready != nil {
+		close(ready)
+	}
 
 	errCh := make(chan error, 2)
 	go func() { errCh <- serveHTTP(auditHTTP, auditListener) }()
