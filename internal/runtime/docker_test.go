@@ -56,6 +56,9 @@ func TestBuildContainerSpecUsesExplicitWorkspaceAndHostSocketsOnly(t *testing.T)
 	if got := spec.Env[EnvModelProxySocket]; got != "/run/codo/model-proxy.sock" {
 		t.Fatalf("unexpected model proxy socket env: %s", got)
 	}
+	if got := spec.Env[EnvWorkspaceMountPath]; got != "/workspace" {
+		t.Fatalf("unexpected workspace mount env: %s", got)
+	}
 	if got := spec.Env[EnvAuditPreviewBytes]; got != "2048" {
 		t.Fatalf("unexpected preview bytes env: %s", got)
 	}
@@ -90,5 +93,24 @@ func TestLoadOrCreateStatePersistsRuntimeIdentity(t *testing.T) {
 	}
 	if first.RuntimeInstanceID != second.RuntimeInstanceID {
 		t.Fatalf("runtime_instance_id changed across reload: %q != %q", first.RuntimeInstanceID, second.RuntimeInstanceID)
+	}
+}
+
+func TestAssistantRuntimeOutOfDate(t *testing.T) {
+	t.Parallel()
+
+	for _, output := range []string{
+		"usage: codo <control-plane|runtime> ...",
+		"usage: codo <up|control-plane|runtime> ...",
+		`error: unknown assistant subcommand "repl"`,
+		"flag provided but not defined: -workspace-root",
+	} {
+		if !assistantRuntimeOutOfDate(output) {
+			t.Fatalf("expected output to be treated as outdated runtime: %q", output)
+		}
+	}
+
+	if assistantRuntimeOutOfDate("some other docker error") {
+		t.Fatal("unexpected outdated-runtime match")
 	}
 }

@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"github.com/chenan/codo/internal/config"
 	"github.com/chenan/codo/internal/jsonl"
 	"github.com/chenan/codo/internal/provider"
+	"github.com/chenan/codo/internal/transport"
 )
 
 func Serve(ctx context.Context, cfg config.Config) error {
@@ -42,8 +44,8 @@ func ServeWithReady(ctx context.Context, cfg config.Config, ready chan<- struct{
 	}
 	defer proxyListener.Close()
 
-	auditHTTP := &http.Server{Handler: auditCollector.Handler()}
-	proxyHTTP := &http.Server{Handler: proxyServer.Handler()}
+	auditHTTP := &http.Server{Handler: withHealthz(auditCollector.Handler())}
+	proxyHTTP := &http.Server{Handler: withHealthz(proxyServer.Handler())}
 
 	if ready != nil {
 		close(ready)
@@ -63,6 +65,35 @@ func ServeWithReady(ctx context.Context, cfg config.Config, ready chan<- struct{
 		_ = proxyHTTP.Shutdown(context.Background())
 		return err
 	}
+}
+
+func CheckHealth(ctx context.Context, cfg config.Config) error {
+	if err := checkSocketHealth(ctx, cfg.Audit.SocketPath); err != nil {
+		return fmt.Errorf("audit socket unhealthy: %w", err)
+	}
+	if err := checkSocketHealth(ctx, cfg.Proxy.SocketPath); err != nil {
+		return fmt.Errorf("proxy socket unhealthy: %w", err)
+	}
+	return nil
+}
+
+func checkSocketHealth(ctx context.Context, socketPath string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://unix/healthz", nil)
+	if err != nil {
+		return fmt.Errorf("create health request: %w", err)
+	}
+
+	resp, err := transport.NewUnixHTTPClient(socketPath).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("health check failed with status %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
 }
 
 func listenUnix(path string) (net.Listener, error) {
@@ -88,4 +119,14 @@ func serveHTTP(server *http.Server, listener net.Listener) error {
 		return err
 	}
 	return nil
+}
+
+func withHealthz(next http.Handler) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.Handle("/", next)
+	return mux
 }

@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/chenan/codo/internal/bootstrap"
 	"github.com/chenan/codo/internal/config"
@@ -21,34 +22,46 @@ var errUsage = errors.New("usage")
 const configFlagUsage = "Path to runtime config JSON (default: CODO_CONFIG or ~/.codo/config/runtime.json)"
 
 type cli struct {
-	up                func(context.Context, string) error
-	loadConfig        func(string) (config.Config, error)
-	serveControlPlane func(context.Context, config.Config) error
-	buildRuntimeImage func(context.Context, config.Config) error
-	startRuntime      func(context.Context, config.Config) error
-	stopRuntime       func(context.Context, config.Config) error
-	rebuildRuntime    func(context.Context, config.Config) error
-	runtimeStatus     func(context.Context, config.Config) error
-	execInRuntime     func(context.Context, config.Config, string, string, string) error
-	reconnectRuntime  func(context.Context, config.Config, string) error
-	runAuditedBash    func(context.Context, string) error
-	proxyRequest      func(context.Context, string, string, []byte) error
+	up                     func(context.Context, string) error
+	loadConfig             func(string) (config.Config, error)
+	serveControlPlane      func(context.Context, config.Config) error
+	serveControlPlaneReady func(context.Context, config.Config, chan<- struct{}) error
+	controlPlaneHealthy    func(context.Context, config.Config) error
+	buildRuntimeImage      func(context.Context, config.Config) error
+	ensureRuntimeImage     func(context.Context, config.Config) error
+	startRuntime           func(context.Context, config.Config) error
+	stopRuntime            func(context.Context, config.Config) error
+	rebuildRuntime         func(context.Context, config.Config) error
+	runtimeStatus          func(context.Context, config.Config) error
+	execInRuntime          func(context.Context, config.Config, string, string, string) error
+	reconnectRuntime       func(context.Context, config.Config, string) error
+	runAuditedBash         func(context.Context, string) error
+	proxyRequest           func(context.Context, string, string, []byte) error
+	attachAssistantREPL    func(context.Context, config.Config, codoruntime.AssistantREPLOptions) error
+	probeAssistantREPL     func(context.Context, config.Config, codoruntime.AssistantREPLOptions) error
+	runAssistantREPL       func(context.Context, codoruntime.AssistantREPLOptions) error
 }
 
 func defaultCLI() cli {
 	return cli{
-		up:                bootstrap.Up,
-		loadConfig:        loadConfig,
-		serveControlPlane: controlplane.Serve,
-		buildRuntimeImage: codoruntime.BuildRuntimeImage,
-		startRuntime:      codoruntime.EnsureRuntimeStarted,
-		stopRuntime:       codoruntime.StopRuntime,
-		rebuildRuntime:    codoruntime.RebuildRuntime,
-		runtimeStatus:     codoruntime.RuntimeStatus,
-		execInRuntime:     codoruntime.ExecInRuntime,
-		reconnectRuntime:  codoruntime.ReconnectRuntime,
-		runAuditedBash:    codoruntime.RunAuditedBash,
-		proxyRequest:      codoruntime.ProxyRequest,
+		up:                     bootstrap.Up,
+		loadConfig:             loadConfig,
+		serveControlPlane:      controlplane.Serve,
+		serveControlPlaneReady: controlplane.ServeWithReady,
+		controlPlaneHealthy:    controlplane.CheckHealth,
+		buildRuntimeImage:      codoruntime.BuildRuntimeImage,
+		ensureRuntimeImage:     codoruntime.EnsureRuntimeImageAvailable,
+		startRuntime:           codoruntime.EnsureRuntimeStarted,
+		stopRuntime:            codoruntime.StopRuntime,
+		rebuildRuntime:         codoruntime.RebuildRuntime,
+		runtimeStatus:          codoruntime.RuntimeStatus,
+		execInRuntime:          codoruntime.ExecInRuntime,
+		reconnectRuntime:       codoruntime.ReconnectRuntime,
+		runAuditedBash:         codoruntime.RunAuditedBash,
+		proxyRequest:           codoruntime.ProxyRequest,
+		attachAssistantREPL:    codoruntime.AttachAssistantREPL,
+		probeAssistantREPL:     codoruntime.ProbeAssistantREPL,
+		runAssistantREPL:       codoruntime.RunAssistantREPL,
 	}
 }
 
@@ -84,12 +97,29 @@ func (c cli) run(ctx context.Context, args []string) error {
 	switch args[0] {
 	case "up":
 		return c.runUp(ctx, args[1:])
+	case "assistant":
+		return c.runAssistant(ctx, args[1:])
 	case "control-plane":
 		return c.runControlPlane(ctx, args[1:])
 	case "runtime":
 		return c.runRuntime(ctx, args[1:])
 	default:
 		return errUsage
+	}
+}
+
+func (c cli) runAssistant(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("%w: codo assistant <chat|repl>", errUsage)
+	}
+
+	switch args[0] {
+	case "chat":
+		return c.runAssistantChat(ctx, args[1:])
+	case "repl":
+		return c.runAssistantRepl(ctx, args[1:])
+	default:
+		return fmt.Errorf("unknown assistant subcommand %q", args[0])
 	}
 }
 
@@ -121,6 +151,136 @@ func (c cli) runControlPlane(ctx context.Context, args []string) error {
 		return err
 	}
 	return c.serveControlPlane(ctx, cfg)
+}
+
+func (c cli) runAssistantChat(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("assistant chat", flag.ContinueOnError)
+	var configPath string
+	var opts codoruntime.AssistantREPLOptions
+	fs.StringVar(&configPath, "config", "", configFlagUsage)
+	fs.StringVar(&opts.SessionID, "session-id", "", "Optional stable session ID override")
+	fs.StringVar(&opts.Model, "model", "", "Assistant model name (default: CODO_ASSISTANT_MODEL or runtime default)")
+	fs.IntVar(&opts.MaxToolCalls, "max-tool-calls", 0, "Maximum assistant tool-call iterations per user turn")
+	fs.DurationVar(&opts.BashTimeout, "bash-timeout", 0, "Per-tool bash timeout")
+	fs.IntVar(&opts.BashOutputBytes, "bash-output-bytes", 0, "Captured bash stdout/stderr bytes per tool call")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if len(fs.Args()) != 0 {
+		return fmt.Errorf("usage: codo assistant chat [--config <path>] [--session-id <id>]")
+	}
+
+	cfg, err := c.loadConfig(configPath)
+	if err != nil {
+		return err
+	}
+	return c.startAssistantChatSession(ctx, cfg, opts)
+}
+
+func (c cli) runAssistantRepl(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("assistant repl", flag.ContinueOnError)
+	var opts codoruntime.AssistantREPLOptions
+	fs.StringVar(&opts.SessionID, "session-id", "", "Optional stable session ID override")
+	fs.StringVar(&opts.Model, "model", "", "Assistant model name (default: CODO_ASSISTANT_MODEL or runtime default)")
+	fs.StringVar(&opts.WorkspaceRoot, "workspace-root", "", "Workspace root visible inside the runtime container")
+	fs.IntVar(&opts.MaxToolCalls, "max-tool-calls", 0, "Maximum assistant tool-call iterations per user turn")
+	fs.DurationVar(&opts.BashTimeout, "bash-timeout", 0, "Per-tool bash timeout")
+	fs.IntVar(&opts.BashOutputBytes, "bash-output-bytes", 0, "Captured bash stdout/stderr bytes per tool call")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if len(fs.Args()) != 0 {
+		return fmt.Errorf("usage: codo assistant repl")
+	}
+	return c.runAssistantREPL(ctx, opts)
+}
+
+func (c cli) startAssistantChatSession(ctx context.Context, cfg config.Config, opts codoruntime.AssistantREPLOptions) error {
+	healthCtx, cancelHealth := context.WithTimeout(ctx, time.Second)
+	healthErr := c.controlPlaneHealthy(healthCtx, cfg)
+	cancelHealth()
+
+	var (
+		controlPlaneCtx    context.Context
+		cancelControlPlane context.CancelFunc
+		controlPlaneErrCh  chan error
+	)
+	if healthErr != nil {
+		controlPlaneCtx, cancelControlPlane = context.WithCancel(ctx)
+		readyCh := make(chan struct{})
+		controlPlaneErrCh = make(chan error, 1)
+		go func() {
+			controlPlaneErrCh <- c.serveControlPlaneReady(controlPlaneCtx, cfg, readyCh)
+		}()
+
+		select {
+		case <-readyCh:
+		case err := <-controlPlaneErrCh:
+			cancelControlPlane()
+			if err != nil {
+				return err
+			}
+			return nil
+		case <-ctx.Done():
+			cancelControlPlane()
+			return ctx.Err()
+		}
+	}
+
+	if err := c.ensureRuntimeImage(ctx, cfg); err != nil {
+		if cancelControlPlane != nil {
+			cancelControlPlane()
+			<-controlPlaneErrCh
+		}
+		return err
+	}
+	if err := c.startRuntime(ctx, cfg); err != nil {
+		if cancelControlPlane != nil {
+			cancelControlPlane()
+			<-controlPlaneErrCh
+		}
+		return err
+	}
+	if err := c.ensureAssistantRuntimeCompatible(ctx, cfg, opts); err != nil {
+		if cancelControlPlane != nil {
+			cancelControlPlane()
+			<-controlPlaneErrCh
+		}
+		return err
+	}
+
+	attachErr := c.attachAssistantREPL(ctx, cfg, opts)
+	if cancelControlPlane == nil {
+		return attachErr
+	}
+
+	cancelControlPlane()
+	controlPlaneErr := <-controlPlaneErrCh
+	if attachErr != nil {
+		return attachErr
+	}
+	if controlPlaneErr != nil {
+		return controlPlaneErr
+	}
+	return nil
+}
+
+func (c cli) ensureAssistantRuntimeCompatible(ctx context.Context, cfg config.Config, opts codoruntime.AssistantREPLOptions) error {
+	if err := c.probeAssistantREPL(ctx, cfg, opts); err != nil {
+		if !errors.Is(err, codoruntime.ErrAssistantRuntimeOutOfDate) {
+			return err
+		}
+		if err := c.buildRuntimeImage(ctx, cfg); err != nil {
+			return fmt.Errorf("rebuild stale runtime image for assistant chat: %w", err)
+		}
+		if err := c.rebuildRuntime(ctx, cfg); err != nil {
+			return fmt.Errorf("recreate runtime container with updated assistant binary: %w", err)
+		}
+		if err := c.probeAssistantREPL(ctx, cfg, opts); err != nil {
+			return fmt.Errorf("runtime container is still incompatible after rebuild: %w", err)
+		}
+	}
+	return nil
 }
 
 func (c cli) runRuntime(ctx context.Context, args []string) error {
@@ -247,5 +407,5 @@ func (c cli) withConfig(args []string, fn func(config.Config) error) error {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: codo <up|control-plane|runtime> ...")
+	fmt.Fprintln(os.Stderr, "usage: codo <up|assistant|control-plane|runtime> ...")
 }

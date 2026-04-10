@@ -16,6 +16,7 @@
 - `internal/bootstrap/bootstrap.go`: unified `codo up` orchestration.
 - `internal/controlplane/proxy.go`: Bailian OpenAI-compatible model proxy with host-side credential injection and JSONL audit logs.
 - `internal/controlplane/audit.go`: host-side bash audit collector.
+- `internal/runtime/assistant.go`: container-side assistant REPL, chat loop, and v1 `bash` tool integration.
 - `internal/runtime/docker.go`: runtime lifecycle tooling and generated Docker container spec.
 - `internal/runtime/bash.go`: audited container-side bash wrapper and model proxy client.
 - `examples/runtime-config.example.json`: starter template for copied custom configs.
@@ -74,6 +75,62 @@ On first run, `codo up` will create:
 
 It will also build the runtime image if the configured image is missing locally, then start the host control plane and the long-lived assistant container. The command stays in the foreground until interrupted.
 
+Start an assistant session from the host terminal:
+
+```bash
+./codo assistant chat
+```
+
+`assistant chat` reuses a healthy control plane when one is already running. If the sockets are missing or unhealthy, it starts a session-scoped control plane, ensures the runtime container is available, and attaches your terminal to the in-container REPL.
+
+If the runtime container is still using an older in-image `codo` binary that does not support `assistant repl`, `assistant chat` rebuilds the image and recreates the container once before retrying.
+
+Pick a model explicitly when you need to override the default:
+
+```bash
+./codo assistant chat --model qwen-max
+```
+
+You can also set a process-wide default model:
+
+```bash
+export CODO_ASSISTANT_MODEL=qwen-max
+./codo assistant chat
+```
+
+Reuse a stable audit/session identifier when needed:
+
+```bash
+./codo assistant chat --session-id sess_example_123
+```
+
+## Assistant REPL
+
+The host-side command above lands you in the container-local REPL entrypoint, `codo assistant repl`. Inside the REPL:
+
+- Type normal text to send a user turn to the model through the mounted host proxy.
+- Use `/help` to show the supported control commands.
+- Use `/reset` to discard the in-memory conversation history for the current session.
+- Use `/exit` to end the REPL without stopping the long-lived runtime container.
+
+The REPL can also be started directly inside the runtime container if you are already attached to a shell there.
+
+## Assistant V1 Behavior
+
+- Turns are line-oriented and non-streaming.
+- Conversation history is kept only in memory for the lifetime of the REPL process.
+- The only registered v1 tool is `bash`.
+- `bash` commands run through the existing audited execution path inside the container.
+- The tool loop is bounded per user turn, and malformed or unsupported tool calls are converted into failing tool results instead of crashing the session.
+- The assistant resolves tool working directories to the configured workspace mount path or one of its descendants.
+- Tool stdout and stderr are captured with byte limits and truncation indicators before being sent back into the chat loop.
+
+You can tighten or relax the runtime limits from the CLI:
+
+```bash
+./codo assistant chat --max-tool-calls 4 --bash-timeout 20s --bash-output-bytes 2048
+```
+
 ## Low-Level Commands
 
 The low-level commands still work and use the same config discovery rules:
@@ -86,6 +143,13 @@ The low-level commands still work and use the same config discovery rules:
 ./codo runtime exec "pwd && ls -la"
 ./codo runtime reconnect
 ./codo runtime rebuild
+```
+
+The assistant entrypoints are:
+
+```bash
+./codo assistant chat
+codo assistant repl
 ```
 
 Use `--config` when you want a specific file:
@@ -177,10 +241,19 @@ codo runtime proxy-request --method POST --path /v1/chat/completions --body-file
 
 The container does not receive the Bailian API key or upstream base URL. The host-side proxy injects the credential when forwarding the request.
 
+## Known Limits
+
+- There is no transcript persistence or session resume in v1.
+- There is no streaming token rendering or full-screen TUI yet.
+- The assistant currently exposes only the `bash` tool.
+- Workspace scoping constrains the default cwd, but commands still run inside a Linux container and can inspect other in-container paths that exist there.
+
 ## Validation
 
 The repository includes tests for:
 
+- Assistant CLI routing and control-plane lifecycle reuse/startup
+- Container-side REPL controls, reset behavior, tool-call handling, and workspace safety bounds
 - Explicit workspace-only container mounts and absence of upstream credentials in container env
 - Runtime identity persistence across reloads
 - Fail-closed bash execution when the audit collector is unavailable
