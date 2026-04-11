@@ -23,6 +23,8 @@ import (
 	"github.com/chenan/codo/internal/transport"
 )
 
+var newProxyHTTPClient = transport.NewStreamingUnixHTTPClient
+
 type BashExecutionRequest struct {
 	Command      string
 	Workdir      string
@@ -216,23 +218,9 @@ func RunAuditedBash(ctx context.Context, command string) error {
 }
 
 func ProxyRoundTrip(ctx context.Context, method string, path string, body []byte) ([]byte, int, error) {
-	socketPath := os.Getenv(EnvModelProxySocket)
-	if socketPath == "" {
-		return nil, 0, fmt.Errorf("%s is required", EnvModelProxySocket)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, "http://unix"+normalizeProxyPath(path), bytes.NewReader(body))
+	resp, err := ProxyStreamRequest(ctx, method, path, body)
 	if err != nil {
-		return nil, 0, fmt.Errorf("create proxy request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Codo-Runtime-Instance-ID", os.Getenv(EnvRuntimeInstanceID))
-	req.Header.Set("X-Codo-Session-ID", sessionID())
-	req.Header.Set("X-Codo-Workspace-ID", os.Getenv(EnvWorkspaceID))
-
-	resp, err := transport.NewUnixHTTPClient(socketPath).Do(req)
-	if err != nil {
-		return nil, 0, fmt.Errorf("send proxy request: %w", err)
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 
@@ -243,16 +231,40 @@ func ProxyRoundTrip(ctx context.Context, method string, path string, body []byte
 	return bodyBytes, resp.StatusCode, nil
 }
 
+func ProxyStreamRequest(ctx context.Context, method string, path string, body []byte) (*http.Response, error) {
+	socketPath := os.Getenv(EnvModelProxySocket)
+	if socketPath == "" {
+		return nil, fmt.Errorf("%s is required", EnvModelProxySocket)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, "http://unix"+normalizeProxyPath(path), bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create proxy request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Codo-Runtime-Instance-ID", os.Getenv(EnvRuntimeInstanceID))
+	req.Header.Set("X-Codo-Session-ID", sessionID())
+	req.Header.Set("X-Codo-Workspace-ID", os.Getenv(EnvWorkspaceID))
+
+	resp, err := newProxyHTTPClient(socketPath).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("send proxy request: %w", err)
+	}
+	return resp, nil
+}
+
 func ProxyRequest(ctx context.Context, method string, path string, body []byte) error {
-	bodyBytes, statusCode, err := ProxyRoundTrip(ctx, method, path, body)
+	resp, err := ProxyStreamRequest(ctx, method, path, body)
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stdout.Write(bodyBytes); err != nil {
+	defer resp.Body.Close()
+
+	if _, err := io.Copy(os.Stdout, resp.Body); err != nil {
 		return fmt.Errorf("write proxy response: %w", err)
 	}
-	if statusCode >= 400 {
-		return fmt.Errorf("proxy request failed with status %d", statusCode)
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("proxy request failed with status %d", resp.StatusCode)
 	}
 	return nil
 }

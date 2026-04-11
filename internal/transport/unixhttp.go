@@ -8,14 +8,25 @@ import (
 )
 
 func NewUnixHTTPClient(socketPath string) *http.Client {
+	return newUnixHTTPClient(socketPath, 60*time.Second)
+}
+
+func NewStreamingUnixHTTPClient(socketPath string) *http.Client {
+	return newUnixHTTPClient(socketPath, 0)
+}
+
+func newUnixHTTPClient(socketPath string, timeout time.Duration) *http.Client {
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
 		},
 	}
 
-	return &http.Client{
+	client := &http.Client{
 		Transport: transport,
-		Timeout:   60 * time.Second,
 	}
+	if timeout > 0 {
+		client.Timeout = timeout
+	}
+	return client
 }

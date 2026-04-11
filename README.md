@@ -117,13 +117,15 @@ The REPL can also be started directly inside the runtime container if you are al
 
 ## Assistant V1 Behavior
 
-- Turns are line-oriented and non-streaming.
+- Turns remain line-oriented, but assistant text is rendered incrementally as streamed completion deltas arrive.
 - Conversation history is kept only in memory for the lifetime of the REPL process.
 - The only registered v1 tool is `bash`.
 - `bash` commands run through the existing audited execution path inside the container.
-- The tool loop is bounded per user turn, and malformed or unsupported tool calls are converted into failing tool results instead of crashing the session.
+- Streamed `tool_calls` are assembled before tool execution, and the tool loop remains bounded per user turn.
+- Malformed or unsupported tool calls are converted into failing tool results instead of crashing the session.
 - The assistant resolves tool working directories to the configured workspace mount path or one of its descendants.
 - Tool stdout and stderr are captured with byte limits and truncation indicators before being sent back into the chat loop.
+- If a streamed turn fails before completion, any partial terminal output is not committed into durable in-memory session history.
 
 You can tighten or relax the runtime limits from the CLI:
 
@@ -240,12 +242,14 @@ codo runtime proxy-request --method POST --path /v1/chat/completions --body-file
 ```
 
 The container does not receive the Bailian API key or upstream base URL. The host-side proxy injects the credential when forwarding the request.
+For streamed assistant turns, the proxy forwards incremental upstream bytes back into the container instead of buffering the full response first.
 
 ## Known Limits
 
 - There is no transcript persistence or session resume in v1.
-- There is no streaming token rendering or full-screen TUI yet.
+- There is no full-screen TUI or rich terminal layout yet; streaming remains plain line-oriented output.
 - The assistant currently exposes only the `bash` tool.
+- There is no dedicated per-turn model timeout yet; streamed turns currently rely on request-context cancellation and transport failure behavior.
 - Workspace scoping constrains the default cwd, but commands still run inside a Linux container and can inspect other in-container paths that exist there.
 
 ## Validation
@@ -253,11 +257,11 @@ The container does not receive the Bailian API key or upstream base URL. The hos
 The repository includes tests for:
 
 - Assistant CLI routing and control-plane lifecycle reuse/startup
-- Container-side REPL controls, reset behavior, tool-call handling, and workspace safety bounds
+- Container-side REPL controls, streamed text rendering, streamed tool-call handling, malformed or incomplete stream failures, and workspace safety bounds
 - Explicit workspace-only container mounts and absence of upstream credentials in container env
 - Runtime identity persistence across reloads
 - Fail-closed bash execution when the audit collector is unavailable
-- Host-side audit record persistence
+- Host-side audit record persistence and streamed proxy passthrough
 - Host-side proxy credential injection and request audit logging
 - Config discovery precedence and default-home bootstrap behavior
 - Unified `codo up` orchestration and CLI compatibility with low-level commands

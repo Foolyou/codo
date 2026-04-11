@@ -20,7 +20,7 @@ type ModelProxy struct {
 func NewModelProxy(adapter provider.Adapter, writer *jsonl.Writer) *ModelProxy {
 	return &ModelProxy{
 		adapter: adapter,
-		client:  &http.Client{Timeout: 120 * time.Second},
+		client:  &http.Client{},
 		writer:  writer,
 	}
 }
@@ -51,12 +51,7 @@ func (p *ModelProxy) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	copyResponseHeader(w.Header(), upstreamResp.Header)
 	w.WriteHeader(upstreamResp.StatusCode)
-	responseBytes, copyErr := io.Copy(w, upstreamResp.Body)
-	if copyErr != nil {
-		http.Error(w, fmt.Sprintf("stream upstream response: %v", copyErr), http.StatusBadGateway)
-		return
-	}
-	_ = responseBytes
+	_, copyErr := streamResponse(w, upstreamResp.Body)
 
 	record := protocol.ProxyAuditRecord{
 		RequestID:         headerOrDefault(r.Header.Get("X-Request-ID"), startedAt),
@@ -73,8 +68,39 @@ func (p *ModelProxy) handleRequest(w http.ResponseWriter, r *http.Request) {
 		DurationMillis:    time.Since(startedAt).Milliseconds(),
 	}
 	if err := p.writer.Append(record); err != nil {
-		http.Error(w, fmt.Sprintf("persist proxy audit log: %v", err), http.StatusInternalServerError)
 		return
+	}
+	if copyErr != nil {
+		return
+	}
+}
+
+func streamResponse(dst http.ResponseWriter, src io.Reader) (int64, error) {
+	flusher, _ := dst.(http.Flusher)
+	buffer := make([]byte, 32*1024)
+
+	var written int64
+	for {
+		readBytes, readErr := src.Read(buffer)
+		if readBytes > 0 {
+			writeBytes, writeErr := dst.Write(buffer[:readBytes])
+			written += int64(writeBytes)
+			if writeErr != nil {
+				return written, fmt.Errorf("write proxied response: %w", writeErr)
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			if writeBytes != readBytes {
+				return written, io.ErrShortWrite
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				return written, nil
+			}
+			return written, fmt.Errorf("stream upstream response: %w", readErr)
+		}
 	}
 }
 

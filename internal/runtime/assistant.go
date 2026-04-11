@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,8 +35,8 @@ type AssistantREPLOptions struct {
 }
 
 type assistantDependencies struct {
-	requestCompletion func(context.Context, AssistantREPLOptions, []assistantMessage) (assistantMessage, error)
-	executeBash       func(context.Context, BashExecutionRequest) (BashExecutionResult, error)
+	openCompletionStream func(context.Context, AssistantREPLOptions, []assistantMessage) (assistantCompletionStream, error)
+	executeBash          func(context.Context, BashExecutionRequest) (BashExecutionResult, error)
 }
 
 type assistantSession struct {
@@ -70,12 +69,6 @@ type assistantChatCompletionRequest struct {
 	Tools      []assistantToolDefinition `json:"tools"`
 	ToolChoice string                    `json:"tool_choice,omitempty"`
 	Stream     bool                      `json:"stream"`
-}
-
-type assistantChatCompletionResponse struct {
-	Choices []struct {
-		Message assistantMessage `json:"message"`
-	} `json:"choices"`
 }
 
 type assistantToolDefinition struct {
@@ -221,9 +214,12 @@ func runAssistantREPL(ctx context.Context, opts AssistantREPLOptions, input io.R
 			fmt.Fprintln(output, "Session ended.")
 			return nil
 		default:
-			reply, err := session.RunTurn(ctx, line)
+			reply, rendered, err := session.RunTurnStream(ctx, line, output)
 			if err != nil {
 				fmt.Fprintf(output, "error: %v\n", err)
+				continue
+			}
+			if rendered {
 				continue
 			}
 			if strings.TrimSpace(reply) == "" {
@@ -254,27 +250,36 @@ func (s *assistantSession) Reset() {
 }
 
 func (s *assistantSession) RunTurn(ctx context.Context, userInput string) (string, error) {
+	reply, _, err := s.RunTurnStream(ctx, userInput, nil)
+	return reply, err
+}
+
+func (s *assistantSession) RunTurnStream(ctx context.Context, userInput string, output io.Writer) (string, bool, error) {
 	working := append([]assistantMessage(nil), s.messages...)
 	working = append(working, assistantMessage{
 		Role:    "user",
 		Content: userInput,
 	})
+	renderer := newAssistantStreamRenderer(output)
 
 	toolIterations := 0
 	for {
-		message, err := s.deps.requestCompletion(ctx, s.opts, working)
+		step, err := s.requestAssistantStep(ctx, working, renderer)
 		if err != nil {
-			return "", err
+			_ = renderer.FinishLine()
+			return "", renderer.rendered, err
 		}
 
-		content := flattenAssistantContent(message.Content)
-		if len(message.ToolCalls) == 0 {
+		if len(step.ToolCalls) == 0 {
 			working = append(working, assistantMessage{
 				Role:    "assistant",
-				Content: content,
+				Content: step.Content,
 			})
 			s.messages = working
-			return content, nil
+			if err := renderer.FinishLine(); err != nil {
+				return "", renderer.rendered, err
+			}
+			return step.Content, renderer.rendered, nil
 		}
 
 		if toolIterations >= s.opts.MaxToolCalls {
@@ -284,20 +289,26 @@ func (s *assistantSession) RunTurn(ctx context.Context, userInput string) (strin
 				Content: limitMessage,
 			})
 			s.messages = working
-			return limitMessage, nil
+			if err := renderer.FinishLine(); err != nil {
+				return "", renderer.rendered, err
+			}
+			return limitMessage, renderer.rendered, nil
 		}
 
 		assistantEntry := assistantMessage{
 			Role:      "assistant",
 			Content:   nil,
-			ToolCalls: message.ToolCalls,
+			ToolCalls: step.ToolCalls,
 		}
-		if content != "" {
-			assistantEntry.Content = content
+		if step.Content != "" {
+			assistantEntry.Content = step.Content
 		}
 		working = append(working, assistantEntry)
+		if err := renderer.FinishLine(); err != nil {
+			return "", renderer.rendered, err
+		}
 
-		for _, toolCall := range message.ToolCalls {
+		for _, toolCall := range step.ToolCalls {
 			toolResult := s.executeToolCall(ctx, toolCall)
 			working = append(working, assistantMessage{
 				Role:       "tool",
@@ -308,6 +319,16 @@ func (s *assistantSession) RunTurn(ctx context.Context, userInput string) (strin
 
 		toolIterations++
 	}
+}
+
+func (s *assistantSession) requestAssistantStep(ctx context.Context, messages []assistantMessage, renderer *assistantStreamRenderer) (assistantCompletionStep, error) {
+	stream, err := s.deps.openCompletionStream(ctx, s.opts, messages)
+	if err != nil {
+		return assistantCompletionStep{}, err
+	}
+	defer stream.Close()
+
+	return consumeAssistantCompletionStream(stream, renderer)
 }
 
 func (s *assistantSession) executeToolCall(ctx context.Context, toolCall assistantToolCall) string {
@@ -421,39 +442,9 @@ func (s *assistantSession) executeBashTool(ctx context.Context, toolCall assista
 
 func defaultAssistantDependencies() assistantDependencies {
 	return assistantDependencies{
-		requestCompletion: requestAssistantCompletion,
-		executeBash:       ExecuteAuditedBash,
+		openCompletionStream: openAssistantCompletionStream,
+		executeBash:          ExecuteAuditedBash,
 	}
-}
-
-func requestAssistantCompletion(ctx context.Context, opts AssistantREPLOptions, messages []assistantMessage) (assistantMessage, error) {
-	payload, err := json.Marshal(assistantChatCompletionRequest{
-		Model:      opts.Model,
-		Messages:   messages,
-		Tools:      []assistantToolDefinition{assistantBashToolDefinition()},
-		ToolChoice: "auto",
-		Stream:     false,
-	})
-	if err != nil {
-		return assistantMessage{}, fmt.Errorf("marshal chat completion request: %w", err)
-	}
-
-	responseBody, statusCode, err := ProxyRoundTrip(ctx, http.MethodPost, "/v1/chat/completions", payload)
-	if err != nil {
-		return assistantMessage{}, err
-	}
-	if statusCode >= 400 {
-		return assistantMessage{}, fmt.Errorf("proxy request failed with status %d: %s", statusCode, strings.TrimSpace(string(responseBody)))
-	}
-
-	var response assistantChatCompletionResponse
-	if err := json.Unmarshal(responseBody, &response); err != nil {
-		return assistantMessage{}, fmt.Errorf("decode chat completion response: %w", err)
-	}
-	if len(response.Choices) == 0 {
-		return assistantMessage{}, fmt.Errorf("chat completion returned no choices")
-	}
-	return response.Choices[0].Message, nil
 }
 
 func assistantBashToolDefinition() assistantToolDefinition {
